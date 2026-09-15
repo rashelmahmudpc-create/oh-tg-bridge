@@ -1,0 +1,106 @@
+name: OH TG Bridge (24/7 free)
+
+# কীভাবে ২৪/৭ চলে:
+#  - প্রতি ২ ঘণ্টায় schedule ট্রিগার হয়, কিন্তু concurrency গ্রুপের কারণে একই
+#    সময়ে শুধু একটা কপি চলে, বাকিটা "pending" হয়ে অপেক্ষা করে।
+#  - প্রতিটি জব সর্বোচ্চ ~৫.৮ ঘণ্টা চলে (GitHub-এর ৬ ঘণ্টার হার্ড লিমিট)।
+#    থামার সাথে সাথেই অপেক্ষমান জবটা শুরু হয় → প্রায় নিরবচ্ছিন্ন।
+#  - গ্যাপে (~১০-৩০ সেকেন্ড) আসা মেসেজ হারায় না, কারণ টেলিগ্রাম ২৪ ঘণ্টা
+#    আপডেট ধরে রাখে এবং বট offset দিয়ে সেগুলো আবার তুলে নেয়।
+#  - state.db রিপোতে কমিট হয়, তাই রিস্টার্টের পরেও চলমান কনভারসেশন মনে থাকে।
+#
+# পাবলিক রিপোতে GitHub Actions মিনিট আনলিমিটেড ফ্রি। কার্ড লাগবে না।
+
+on:
+  workflow_dispatch:          # ম্যানুয়ালি "Run workflow" চাপলেও চলবে
+  schedule:
+    - cron: '*/5 * * * *'     # প্রতি ২ ঘণ্টায় ব্যাকআপ ট্রিগার
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: openhands-telegram-bot
+  cancel-in-progress: false   # চলমান জব শেষ না হওয়া পর্যন্ত নতুনটা অপেক্ষা করবে
+
+permissions:
+  contents: write             # state.db কমিট করার জন্য
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: কোড আনা
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Python সেটআপ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pillow (ছবি ছোট করে খরচ কমানোর জন্য)
+        run: python -m pip install --quiet pillow
+
+      - name: git পরিচয় সেট
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: বট চালানো (~৫.৮ ঘণ্টা)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENHANDS_API_KEY: ${{ secrets.OPENHANDS_API_KEY }}
+          ALLOWED_TELEGRAM_IDS: ${{ secrets.ALLOWED_TELEGRAM_IDS }}
+          VERBOSITY: quiet
+          LIVE_CARD: 'false'
+          POLL_INTERVAL: '0.6'
+          IDLE_POLL_INTERVAL: '0.8'
+          DONE_GRACE: '2.5'
+          RESTART_KEEP_WINDOW: '30'
+          BIG_TEXT_CHARS: '800'
+          PHOTO_MAX_PX: '1024'
+          PHOTO_QUALITY: '72'
+          LLM_MODEL: openhands/deepseek-v4.1-flash
+          AGENT_PROFILE_ID: 'gemini-free'   # ফ্রি জেমিনি ইঞ্জিন (BYOK প্রোভাইডার কানেকশন)
+          SYSTEM_SUFFIX: "Always reply in Bangla unless the user writes in another language. Separate internal work from the final message: never show tool calls, shell commands, logs, planning or progress in the final message — only the result. Mobile-friendly clean output: short paragraphs, bullet/numbered lists instead of wide or ASCII tables, at most 2-3 short headings, links as [descriptive text](url) never bare long URLs, code only inside fenced blocks. Use simple natural Bangla like '🎉 কাজটি হয়ে গেছে।', not robotic formal sentences. Put the most important thing first (the link, file or direct answer), keep it under 6 short sentences, and never send the same answer twice. When serving a website: always serve it in background on port 12000 bound to 0.0.0.0 with index.html at the served root; verify the PUBLIC work-1 URL returns HTTP 200 with curl before sharing it; share the link only once."
+          DB_PATH: state.db
+          AUTORESTORE: 'true'
+          GH_PAT: ${{ secrets.GH_PAT }}
+          STATE_SYNC: '1'
+          STATE_GIT_REPO: rashelmahmudpc-create/agent-hq-vault
+          PAGES_OWNER: sheikhrashel47-stack
+          PAGES_REPO: rashel-site
+        run: |
+          echo "রিপো কনটেন্ট:"; ls -la
+          # Secrets ঠিকমতো সেট হয়েছে কিনা আগে যাচাই (মান প্রিন্ট করা হবে না)
+          missing=""
+          [ -z "$TELEGRAM_BOT_TOKEN" ]  && missing="$missing TELEGRAM_BOT_TOKEN"
+          [ -z "$OPENHANDS_API_KEY" ]   && missing="$missing OPENHANDS_API_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Secrets সেট করা নেই:$missing"
+            echo "রিপো -> Settings -> Secrets and variables -> Actions এ গিয়ে এগুলো যোগ করুন।"
+            exit 1
+          fi
+          echo "Secrets ঠিক আছে ✓ — বট চালু হচ্ছে…"
+
+          set +e
+          deadline=$(( $(date +%s) + 348*60 ))
+          while [ $(date +%s) -lt $deadline ]; do
+            python3 bot.py
+            code=$?
+            echo "bot exited code $code - restart in 5s (crash loop)"
+            sleep 5
+          done
+          set -e
+          echo "baton -> next run"
+
+      - name: পরের রান ডিসপ্যাচ (ব্যাটন)
+        if: always()
+        run: |
+          curl -s -o /dev/null -w "dispatch:%{http_code}\n" -X POST \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches" \
+            -d '{"ref":"main"}' || true
