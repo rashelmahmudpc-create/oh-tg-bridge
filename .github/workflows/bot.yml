@@ -30,6 +30,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: ওয়াচডগ-গার্ড (আগে থেকে বট চললে এই রান নিজেই বাতিল)
+        if: github.event_name == 'schedule'
+        run: |
+          active=$(curl -s -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=10" \
+            | python3 -c "import json,sys; print(sum(1 for r in json.load(sys.stdin)['workflow_runs'] if r['id'] != ${{ github.run_id }}))")
+          echo "other active runs: $active"
+          if [ "$active" != "0" ]; then
+            curl -s -X POST -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel" >/dev/null || true
+            sleep 3
+            exit 1
+          fi
+
       - name: কোড আনা
         uses: actions/checkout@v4
         with:
