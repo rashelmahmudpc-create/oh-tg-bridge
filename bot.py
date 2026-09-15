@@ -154,7 +154,8 @@ class Config:
         self.system_suffix = _env("SYSTEM_SUFFIX")              # এজেন্টের ডিফল্ট নির্দেশনা (পার্সোনা)
         self.obs_truncate = _env_int("OBS_TRUNCATE", 900)
         self.max_startup_events = _env_int("MAX_STARTUP_EVENTS", 60)
-        self.restart_keep_window = _env_float("RESTART_KEEP_WINDOW", 30.0)  # রিস্টার্টের পর কত সেকেন্ডের নতুন আউটপুট ধরা হবে
+        self.restart_keep_window = _env_float("RESTART_KEEP_WINDOW", 30.0)
+        self.watch_extend_min = _env_float("WATCH_EXTEND_MIN", 120.0)  # কিছু ডেলিভার না হলে চুপচাপ ততক্ষণ দেখতে থাকি  # রিস্টার্টের পর কত সেকেন্ডের নতুন আউটপুট ধরা হবে
         self.expect_run_window = _env_float("EXPECT_RUN_WINDOW", 150.0)  # নতুন মেসেজের পর এত সেকেন্ড পর্যন্ত "এজেন্ট চালুর" অপেক্ষা
         self.prewarm = _env_bool("PREWARM", True)   # আইডল sandbox আগেভাগে জাগিয়ে রাখা (সাধারণ মেসেজে সেকেন্ডে উত্তর)
 
@@ -196,7 +197,7 @@ def load_brain() -> None:
 if _env_bool("STATE_SYNC", False):
     import state_sync
     state_sync.configure(_env("GH_PAT"),
-                         _env("STATE_GIT_REPO", "rashelmahmudpc-create/agent-hq-vault"),
+                         _env("STATE_GIT_REPO", "sheikhrashel47-stack/agent-hq-vault"),
                          CFG.db_path)
     state_sync.start()
 
@@ -648,6 +649,7 @@ class Watcher(threading.Thread):
         self.run_start_ts = 0.0
         self.last_agent_kind = ""
         self.run_delivered = 0
+        self.docs_sent = 0
         self.prev_execution = None
         self.last_agent_text = ""
         # লাইভ কার্ড
@@ -807,6 +809,8 @@ class Watcher(threading.Thread):
                     if not self._finish(conv, execution, sandbox):
                         # এজেন্টকে কাজ করিয়ে আনা হচ্ছে -> শেষ বলা হয়নি
                         terminal_since = None
+                        if execution in EXECUTION_DONE:
+                            self.stop_evt.wait(3.0)   # নীরব এক্সটেনশনে ধীর পোলিং
                         continue
                     break
                 time.sleep(1.0)
@@ -883,6 +887,7 @@ class Watcher(threading.Thread):
         if doc_bytes:
             try:
                 TG.send_document(self.chat_id, doc_fname, doc_bytes, caption=f"📎 {doc_fname}")
+                self.docs_sent += 1
             except Exception as e:
                 log("doc send failed:", str(e)[:120])
 
@@ -891,6 +896,7 @@ class Watcher(threading.Thread):
             data = build_html_file(text, title)
             name = f"output-{self.out_n}.html"
             TG.send_document(self.chat_id, name, data, caption=f"🤖 {first_line(clean)}")
+            self.docs_sent += 1
             return
         self.send(md_to_telegram(text))
 
@@ -1029,6 +1035,15 @@ class Watcher(threading.Thread):
             self.run_actions = 0
             return False
 
+        # 🕯 নীরব-এক্সটেনশন: এই সাইকেলে এখনো কিছুই ডেলিভার হয়নি অথচ execution
+        # DONE দেখাচ্ছে (স্যান্ডবক্সের ঝাপসা স্ট্যাটাস) -> আগেভাগে "শেষ" নয়;
+        # WATCH_EXTEND_MIN মিনিট চুপচাপ দেখতে থাকি, আউটপুট এলে সাথে সাথে পাঠাব
+        if (self.run_delivered == 0 and self.docs_sent == 0
+                and execution not in ("error", "stuck")
+                and time.time() - self.start_ts < CFG.watch_extend_min * 60):
+            log("nothing delivered yet -> silent extension (no false finish)")
+            return False
+
         # 🛡 ডেলিভারি সেফটি-নেট: স্ট্রিমিং যেকোনো কারণে মিস করলেও শেষ-লাইনের
         # আগে এই রানের সব এজেন্ট-উত্তর পৌঁছে দিই — উত্তর কখনো হাওয়া যাবে না
         try:
@@ -1081,6 +1096,12 @@ class Watcher(threading.Thread):
         combo = tokens.get("combined_metrics") or tokens
         total = int(combo.get("total_tokens") or
                     ((combo.get("input_tokens") or 0) + (combo.get("output_tokens") or 0)))
+        # 💬 চ্যাট-সাইকেল (কোনো ডকুমেন্ট/খরচ নেই) -> আলাদা "শেষ" লাইন স্প্যাম নয়
+        if (self.docs_sent == 0 and float(cost or 0) <= 0.0
+                and execution not in ("error", "stuck") and not self.last_err):
+            if time.time() - self.start_ts >= CFG.watch_extend_min * 60 - 1:
+                self.send("⚠️ এই রানে কোনো আউটপুট ধরা যায়নি — আবার লিখুন, সাথে সাথে ধরব।")
+            return
         icon = {"finished": "✅", "error": "🛑", "stuck": "⚠️"}.get(execution, "⏹")
         line = f"{icon} শেষ | 💰 ${float(cost):.4f}"
         if total:
