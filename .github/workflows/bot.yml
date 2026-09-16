@@ -49,6 +49,9 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: OCR ইঞ্জিন (tesseract বাংলা+ইংরেজি)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-ben >/dev/null 2>&1 || true
+
       - name: Python সেটআপ
         uses: actions/setup-python@v5
         with:
@@ -82,6 +85,7 @@ jobs:
           DB_PATH: state.db
           AUTORESTORE: 'true'
           GH_PAT: ${{ secrets.GH_PAT }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           STATE_SYNC: '1'
           STATE_GIT_REPO: rashelmahmudpc-create/agent-hq-vault
           PAGES_OWNER: sheikhrashel47-stack

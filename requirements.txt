@@ -1,3 +1,5 @@
 pillow
 pypdf
 python-docx
+gtts
+pytesseract

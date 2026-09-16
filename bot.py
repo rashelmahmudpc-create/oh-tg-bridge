@@ -387,6 +387,26 @@ class Telegram:
         except TelegramAPIError:
             pass
 
+    def send_photo(self, chat_id, content: bytes, caption: str = "") -> dict:
+        self._throttle(chat_id)
+        try:
+            return self.call("sendPhoto", {"chat_id": chat_id, "caption": caption[:1000]},
+                             files={"photo": ("img.jpg", content, "image/jpeg")}, timeout=120)
+        except TelegramAPIError as e:
+            log("send_photo failed:", e.description[:200]); return {}
+
+    def send_voice(self, chat_id, content: bytes, ogg: bool = True) -> dict:
+        self._throttle(chat_id)
+        meth = "sendVoice" if ogg else "sendAudio"
+        field = "voice" if ogg else "audio"
+        fname = "v.ogg" if ogg else "v.mp3"
+        ctype = "audio/ogg" if ogg else "audio/mpeg"
+        try:
+            return self.call(meth, {"chat_id": chat_id},
+                             files={field: (fname, content, ctype)}, timeout=90)
+        except TelegramAPIError as e:
+            log("send_voice failed:", e.description[:200]); return {}
+
     def send_document(self, chat_id, filename: str, content: bytes, caption: str = "") -> dict:
         self._throttle(chat_id)
         ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -923,6 +943,19 @@ class Watcher(threading.Thread):
             self.docs_sent += 1
             return
         self.send(md_to_telegram(text))
+
+        # 📎 এজেন্টের বানানো ফাইলের পাথ থাকলে অটো-ডেলিভারি
+        try:
+            paths = re.findall(r"/workspace/[\w.\-/]+\.(?:docx|pptx|xlsx|pdf|zip|png|jpe?g|mp3|ogg|mp4)",
+                               txt or "", re.I)
+            if paths:
+                threading.Thread(target=auto_deliver_paths,
+                                 args=(self.cid, list(dict.fromkeys(paths))[:2]), daemon=True).start()
+        except Exception as e:
+            log("auto-deliver spawn failed:", str(e)[:100])
+        # 🔊 ভয়েস-আউট চালু থাকলে উত্তরটা voice-এও পাঠাও
+        if self.state.get("voice_out") == "1" and txt and 3 < len(txt) < 3000:
+            threading.Thread(target=_tts_send, args=(self.chat_id, txt), daemon=True).start()
 
     def _ask_link_repair(self, url: str) -> None:
         """মরা লিংক পাঠানো হয়েছে -> এজেন্টকে পোর্ট ১২০০০-এ সার্ভার সারাতে বলি।"""
@@ -2237,6 +2270,117 @@ def _verify_run(chat_id: int, cid: str, payload: str, imgs: list | None = None) 
     TG.send(chat_id, "⚠️ এজেন্ট চালু হতে দেরি করছে — একটু পরে আবার লিখুন অথবা /status দেখুন।")
 
 
+# ===================== ফেজ-২: ভয়েস/OCR/ইমেজ/লিংক/অটো-ডেলিভারি ===================== #
+OCR_RE = re.compile(r"(ocr|ওসিআর|লেখাটা|লিখাটা|পড়ে দাও|extract|টেক্সট বের)", re.I)
+
+
+def groq_transcribe(data: bytes, name: str) -> str:
+    key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not key:
+        return ""
+    b = "----ohbound"
+    body = b"".join([
+        f"--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n".encode(),
+        f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: audio/ogg\r\n\r\n".encode(),
+        data,
+        f"\r\n--{b}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/audio/transcriptions", data=body,
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": f"multipart/form-data; boundary={b}"})
+    d = json.load(urllib.request.urlopen(req, timeout=120))
+    return (d.get("text") or "").strip()
+
+
+def _img_gen(chat_id: int, prompt: str) -> None:
+    try:
+        TG.send(chat_id, "🎨 ছবি বানাচ্ছি (~২০-৬০ সেকেন্ড)…")
+        url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:800])
+               + "?width=1024&height=1024&nologo=true")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = urllib.request.urlopen(req, timeout=180).read()
+        if len(data) < 2000:
+            raise RuntimeError("tiny response")
+        TG.send_photo(chat_id, data, caption=f"🎨 {prompt[:300]}")
+    except Exception as e:
+        log("img gen failed:", str(e)[:150])
+        TG.send(chat_id, "⚠️ ছবি বানানো যায়নি — একটু পরে আবার চেষ্টা করো।")
+
+
+def _tts_send(chat_id: int, text: str) -> None:
+    try:
+        from gtts import gTTS
+        import io as _io, subprocess
+        clean = re.sub(r"https?://\S+|\[.*?\]", " ", text)[:2900]
+        buf = _io.BytesIO()
+        gTTS(text=clean, lang="bn").write_to_fp(buf)
+        mp3 = buf.getvalue()
+        out, ogg = mp3, False
+        try:
+            with open("/tmp/_tts.mp3", "wb") as f:
+                f.write(mp3)
+            r = subprocess.run(["ffmpeg", "-y", "-i", "/tmp/_tts.mp3", "-c:a", "libopus",
+                                "-b:a", "32k", "/tmp/_tts.ogg"],
+                               capture_output=True, timeout=60)
+            if r.returncode == 0:
+                out = open("/tmp/_tts.ogg", "rb").read()
+                ogg = True
+        except Exception:
+            pass
+        TG.send_voice(chat_id, out, ogg=ogg)
+    except Exception as e:
+        log("tts failed:", str(e)[:120])
+
+
+def ocr_image(data: bytes) -> str:
+    try:
+        import pytesseract
+        from PIL import Image
+        import io as _io
+        return (pytesseract.image_to_string(Image.open(_io.BytesIO(data)), lang="ben+eng") or "").strip()
+    except Exception as e:
+        log("ocr failed:", str(e)[:150])
+        return ""
+
+
+def fetch_sandbox_file(cid: str, path: str) -> bytes | None:
+    instr = ("Run EXACTLY this single command, then reply only DONE: "
+             f"base64 -w0 '{path}' > /tmp/oh_get.b64 && wc -c < /tmp/oh_get.b64")
+    oh().send_message(cid, instr, run=True)
+    b64 = ""
+    for _ in range(45):
+        time.sleep(2)
+        b64 = (oh().read_file(cid, "/tmp/oh_get.b64") or "").strip()
+        if b64 and len(b64) > 8:
+            break
+    if not b64:
+        return None
+    try:
+        return base64.b64decode(b64)
+    except Exception:
+        return None
+
+
+def auto_deliver_paths(cid: str, paths: list) -> None:
+    rows = list(db().execute("select chat_id from kv where conversation_id=?", (cid,)))
+    chat = rows[0][0] if rows else None
+    if not chat:
+        return
+    for pth in paths:
+        try:
+            data = fetch_sandbox_file(cid, pth)
+            if not data:
+                continue
+            name = pth.rsplit("/", 1)[-1]
+            if name.lower().endswith((".png", ".jpg", ".jpeg")):
+                TG.send_photo(chat, data, caption=f"📎 {name}")
+            else:
+                TG.send_document(chat, name, data, caption=f"📎 {name} (এজেন্টের বানানো ফাইল)")
+        except Exception as e:
+            log("auto-deliver failed:", pth, str(e)[:120])
+
+
 # ===================== নলেজ-বেস (RAG) + লাইভ-সার্চ ইনজেকশন ===================== #
 KB_DIR = "kb"
 _FTS = None
@@ -2354,6 +2498,23 @@ def enrich_outgoing(chat_id: int, text: str) -> str:
                    "উত্তরে উৎসের ফাইলনাম উল্লেখ করো:\n" + src + "]")
     if SEARCH_RE.search(t):
         pre.append(_LIVE_SEARCH_INSTR)
+    murl = re.search(r"https?://\S+", t)
+    if murl:
+        url = murl.group(0).rstrip(")>,\"'")
+        if re.search(r"(youtube\.com|youtu\.be)", url, re.I):
+            pre.append("[YOUTUBE: sandbox-এ yt-dlp দিয়ে subtitle/transcript নামাও: "
+                       f"yt-dlp --write-auto-sub --skip-download -o /tmp/yt '{url}' ; "
+                       "সাবটাইটেল না পেলে browser/curl চেষ্টা করো; তারপর বাংলা সারসংক্ষেপ + মূল পয়েন্ট দাও]")
+        else:
+            try:
+                req = urllib.request.Request("https://r.jina.ai/" + url,
+                                             headers={"User-Agent": "Mozilla/5.0"})
+                page = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")[:25000]
+                if page.strip():
+                    pre.append("[PAGE-CONTENT (লাইভ ফেচ করা — এর ভিত্তিতে উত্তর দাও, উৎস লিংকসহ):\n"
+                               + page + "]")
+            except Exception as e:
+                log("jina fetch failed:", str(e)[:100])
     return "\n\n".join(pre) + "\n\n" + t if pre else t
 
 
@@ -2621,9 +2782,27 @@ def handle_update(update: dict) -> None:
 
     st = get_state(chat_id)
 
+    # 🎤 ভয়েস মেসেজ -> Groq Whisper ট্রান্সক্রিপ্ট
+    if msg.get("voice") or msg.get("audio"):
+        v = msg.get("voice") or msg.get("audio")
+        try:
+            name, data = TG.download(v["file_id"], max_bytes=20 * 1024 * 1024)
+            tr = groq_transcribe(data or b"", name or "voice.ogg")
+            if not tr:
+                TG.send(chat_id, "⚠️ ভয়েসটা শোনা যায়নি (কী নেই/সার্ভিস ডাউন) — টেক্সট লিখে পাঠাও ভাই।")
+                return
+            msg = dict(msg)
+            msg.pop("voice", None); msg.pop("audio", None)
+            msg["text"] = (msg.get("caption") or "") + f"\n[ভয়েস-মেসেজ ট্রান্সক্রিপ্ট]: {tr}"
+        except Exception as e:
+            log("voice failed:", str(e)[:150])
+            TG.send(chat_id, "⚠️ ভয়েস প্রসেস করা যায়নি — আবার পাঠাও বা টেক্সট লেখো।")
+            return
+
     # ছবি/ডকুমেন্ট
     photo_b64 = None
     photo_ext = "jpg"
+    ocr_text = ""
     doc_name = None
     doc_data = None
     if msg.get("photo"):
@@ -2632,6 +2811,8 @@ def handle_update(update: dict) -> None:
             name, data = TG.download(photo["file_id"])
             if not data:
                 raise RuntimeError("empty")
+            if OCR_RE.search((msg.get("caption") or "") + (msg.get("text") or "")):
+                ocr_text = ocr_image(data)
             data, photo_ext = shrink_photo(data, CFG.photo_max_px, CFG.photo_quality)
             photo_b64 = base64.b64encode(data).decode()
             if len(photo_b64) > CFG.photo_max_b64:
@@ -2673,6 +2854,29 @@ def handle_update(update: dict) -> None:
                 return
 
     text = msg.get("text") or msg.get("caption") or ""
+    if ocr_text:
+        text = (text + "\n" if text else "") + f"[ছবি থেকে OCR টেক্সট]:\n{ocr_text[:6000]}"
+
+    # 🎨 /img — ফ্রি ইমেজ জেনারেশন
+    if text.strip().lower().startswith("/img"):
+        prompt = text.strip()[4:].strip()
+        if not prompt:
+            TG.send(chat_id, " ব্যবহার: /img <কী বানাবে লেখো>")
+            return
+        threading.Thread(target=_img_gen, args=(chat_id, prompt), daemon=True).start()
+        return
+
+    # 🔊 /voice — ভয়েস-আউট টগল
+    if text.strip().lower() in ("/voice", "/voice on", "/voice off"):
+        st = get_state(chat_id)
+        on = st.get("voice_out") == "1"
+        want = None if text.strip().lower() == "/voice" else (text.strip().lower() == "/voice on")
+        new_on = (not on) if want is None else want
+        st["voice_out"] = "1" if new_on else ""
+        save_state(chat_id, st)
+        TG.send(chat_id, "🔊 ঠিক আছে ভাই — এখন থেকে উত্তরগুলো ভয়েসেও পাঠাব।" if new_on
+                else "🔇 ভয়েস-আউট বন্ধ করলাম।")
+        return
 
     # 📚 /kb — ফাইল নলেজ-বেসে সংরক্ষণ (ভল্ট + ইনডেক্স)
     if doc_data and (text or "").strip().lower().startswith("/kb"):
