@@ -953,8 +953,10 @@ class Watcher(threading.Thread):
                                  args=(self.cid, list(dict.fromkeys(paths))[:2]), daemon=True).start()
         except Exception as e:
             log("auto-deliver spawn failed:", str(e)[:100])
-        # 🔊 ভয়েস-আউট চালু থাকলে উত্তরটা voice-এও পাঠাও
-        if self.state.get("voice_out") == "1" and txt and 3 < len(txt) < 3000:
+        # 🔊 মিরর-ভয়েস: ইউজার ভয়েস পাঠালে এই সাইকেলের উত্তরটা ভয়েসেও যাবে
+        vp = VOICE_PENDING.get(self.chat_id)
+        if vp and time.time() - vp < 600 and txt and 3 < len(txt) < 3000:
+            VOICE_PENDING.pop(self.chat_id, None)
             threading.Thread(target=_tts_send, args=(self.chat_id, txt), daemon=True).start()
 
     def _ask_link_repair(self, url: str) -> None:
@@ -2274,6 +2276,35 @@ def _verify_run(chat_id: int, cid: str, payload: str, imgs: list | None = None) 
 OCR_RE = re.compile(r"(ocr|ওসিআর|লেখাটা|লিখাটা|পড়ে দাও|extract|টেক্সট বের)", re.I)
 
 
+VOICE_PENDING: dict = {}   # chat_id -> ts: ভয়েস ইনপুট এসেছে, পরের উত্তরটা ভয়েসেও যাবে
+
+
+def transcribe_voice(data: bytes, name: str) -> str:
+    gk = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if gk and data:
+        try:
+            mime = "audio/wav" if name.lower().endswith(".wav") else "audio/ogg"
+            body = json.dumps({
+                "contents": [{"parts": [
+                    {"text": "Transcribe this audio exactly as spoken (any language). "
+                             "Reply ONLY the transcript text."},
+                    {"inline_data": {"mime_type": mime,
+                                     "data": base64.b64encode(data).decode()}}]}],
+                "generationConfig": {"temperature": 0}}).encode()
+            req = urllib.request.Request(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-3.6-flash:generateContent?key=" + gk,
+                data=body, headers={"Content-Type": "application/json"})
+            d = json.load(urllib.request.urlopen(req, timeout=120))
+            txt = "".join(pt.get("text", "") for pt in
+                          d["candidates"][0]["content"]["parts"]).strip()
+            if txt:
+                return txt
+        except Exception as e:
+            log("gemini stt failed:", str(e)[:150])
+    return groq_transcribe(data, name)
+
+
 def groq_transcribe(data: bytes, name: str) -> str:
     key = (os.environ.get("GROQ_API_KEY") or "").strip()
     if not key:
@@ -2787,7 +2818,9 @@ def handle_update(update: dict) -> None:
         v = msg.get("voice") or msg.get("audio")
         try:
             name, data = TG.download(v["file_id"], max_bytes=20 * 1024 * 1024)
-            tr = groq_transcribe(data or b"", name or "voice.ogg")
+            tr = transcribe_voice(data or b"", name or "voice.ogg")
+            if tr:
+                VOICE_PENDING[chat_id] = time.time()   # মিরর: উত্তর ভয়েসেও যাবে
             if not tr:
                 TG.send(chat_id, "⚠️ ভয়েসটা শোনা যায়নি (কী নেই/সার্ভিস ডাউন) — টেক্সট লিখে পাঠাও ভাই।")
                 return
@@ -2864,18 +2897,6 @@ def handle_update(update: dict) -> None:
             TG.send(chat_id, " ব্যবহার: /img <কী বানাবে লেখো>")
             return
         threading.Thread(target=_img_gen, args=(chat_id, prompt), daemon=True).start()
-        return
-
-    # 🔊 /voice — ভয়েস-আউট টগল
-    if text.strip().lower() in ("/voice", "/voice on", "/voice off"):
-        st = get_state(chat_id)
-        on = st.get("voice_out") == "1"
-        want = None if text.strip().lower() == "/voice" else (text.strip().lower() == "/voice on")
-        new_on = (not on) if want is None else want
-        st["voice_out"] = "1" if new_on else ""
-        save_state(chat_id, st)
-        TG.send(chat_id, "🔊 ঠিক আছে ভাই — এখন থেকে উত্তরগুলো ভয়েসেও পাঠাব।" if new_on
-                else "🔇 ভয়েস-আউট বন্ধ করলাম।")
         return
 
     # 📚 /kb — ফাইল নলেজ-বেসে সংরক্ষণ (ভল্ট + ইনডেক্স)
