@@ -29,6 +29,7 @@ import html as _html_mod
 import json
 import mimetypes
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -783,9 +784,16 @@ class Watcher(threading.Thread):
 
             # ---- হ্যাং-ডিটেক্ট: running কিন্তু ৩ মিনিট ধরে কোনো নতুন ইভেন্ট নেই ----
             if (execution == "running" and self.saw_running and not self._stuck_nudged
-                    and time.time() - getattr(self, "_last_new_ev", 0) > 180):
+                    and time.time() - getattr(self, "_last_new_ev", 0) > 90):
                 self._stuck_nudged = True
-                log("run silent >180s -> nudge agent")
+                log("run silent >90s -> resume sandbox + nudge agent")
+                try:
+                    conv0 = oh().get_conversation(self.cid) or {}
+                    sid0 = conv0.get("sandbox_id")
+                    if sid0 and (conv0.get("sandbox_status") or "") == "PAUSED":
+                        oh().resume_sandbox(sid0)
+                except Exception as e:
+                    log("stuck resume failed:", str(e)[:120])
                 try:
                     oh().send_message(self.cid, _NUDGE_TEXT, run=True)
                 except OpenHandsError as e:
@@ -2743,6 +2751,13 @@ def handle_update(update: dict) -> None:
                 return
 
     text = enrich_outgoing(chat_id, text)
+    try:
+        TG.typing(chat_id)
+        st = get_state(chat_id)
+        if st.get("conversation_id"):
+            wake_sandbox(st["conversation_id"])
+    except Exception as e:
+        log("pre-wake failed:", str(e)[:120])
     send_to_agent(chat_id, text, photo_b64=photo_b64, photo_ext=photo_ext,
                   doc_name=doc_name, doc_data=doc_data)
 
@@ -2957,6 +2972,7 @@ def main() -> int:
     start_health_server()
     threading.Thread(target=_scheduler_loop, daemon=True, name='scheduler').start()
     restore_watchers()
+    threading.Thread(target=_keep_awake_loop, daemon=True, name="keep-awake").start()
 
     offset = int(misc_get("tg_offset") or 0)
     log("বট চালু হয়েছে — মেসেজের অপেক্ষায়…  (বন্ধ করতে Ctrl+C)")
@@ -2993,11 +3009,47 @@ def main() -> int:
     return 0
 
 
+def wake_sandbox(cid: str) -> None:
+    """স্যান্ডবক্স ঘুমিয়ে থাকলে জাগাও — যাতে এজেন্ট সাথে সাথে কাজ শুরু করে।"""
+    try:
+        conv = oh().get_conversation(cid) or {}
+        if (conv.get("sandbox_status") or "") == "PAUSED":
+            sid = conv.get("sandbox_id")
+            if sid:
+                oh().resume_sandbox(sid)
+                log(f"[keep-awake] sandbox resumed for {cid[:8]}")
+    except Exception as e:
+        log("wake_sandbox failed:", str(e)[:120])
+
+
+def _keep_awake_loop() -> None:
+    """প্রতি ৪ মিনিটে অ্যাকটিভ কনভারসেশনের স্যান্ডবক্স জাগিয়ে রাখি — ইউজার মেসেজ
+    দিলে এজেন্ট যেন ঘুম থেকে না জাগে, আগে থেকেই জেগে থাকে।"""
+    while not STOP.is_set():
+        if STOP.wait(240):
+            return
+        try:
+            rows = list(db().execute("select conversation_id from kv"))
+            for (cid,) in rows:
+                if not cid:
+                    continue
+                wake_sandbox(cid)
+        except Exception as e:
+            log("keep-awake loop err:", str(e)[:120])
+
+
 def _safe_handle(upd: dict) -> None:
     try:
         handle_update(upd)
     except Exception:
         log("handler crash:", traceback.format_exc()[:800])
+        try:
+            m = (upd or {}).get("message") or {}
+            cid_chat = m.get("chat", {}).get("id")
+            if cid_chat:
+                TG.send(cid_chat, "⚠️ অভ্যন্তরীণ গলিচ ছিল — মেসেজটা ধরা হয়েছে, আবার পাঠাতে হবে না।")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
