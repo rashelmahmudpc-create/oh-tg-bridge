@@ -650,6 +650,10 @@ class Watcher(threading.Thread):
         self.last_agent_kind = ""
         self.run_delivered = 0
         self.docs_sent = 0
+        self.capture_mode = ""
+        self.capture_deadline = 0.0
+        self.brain_polled = False
+        self.finished_once = False
         self.prev_execution = None
         self.last_agent_text = ""
         # লাইভ কার্ড
@@ -806,11 +810,21 @@ class Watcher(threading.Thread):
                 if terminal_since is None:
                     terminal_since = time.time()
                 elif time.time() - terminal_since >= CFG.done_grace:
+                    if self.capture_mode:
+                        if time.time() < self.capture_deadline:
+                            terminal_since = None
+                            self.stop_evt.wait(3.0)
+                            continue
+                        self.capture_mode = ""
                     if not self._finish(conv, execution, sandbox):
                         # এজেন্টকে কাজ করিয়ে আনা হচ্ছে -> শেষ বলা হয়নি
                         terminal_since = None
                         if execution in EXECUTION_DONE:
                             self.stop_evt.wait(3.0)   # নীরব এক্সটেনশনে ধীর পোলিং
+                        continue
+                    if self._maybe_brain_poll():
+                        terminal_since = None
+                        self.stop_evt.wait(2.0)
                         continue
                     break
                 time.sleep(1.0)
@@ -947,6 +961,11 @@ class Watcher(threading.Thread):
             # এজেন্টের উত্তর = একমাত্র আসল আউটপুট
             if kind == "MessageEvent" and source == "agent":
                 txt = extract_text(ev.get("llm_message")) or extract_text(ev.get("extended_content"))
+                if self.capture_mode and txt.strip():
+                    mode, self.capture_mode = self.capture_mode, ""
+                    threading.Thread(target=self._apply_capture, args=(mode, txt.strip()),
+                                     daemon=True).start()
+                    continue   # মেমোরি-উত্তর: ইউজারকে দেখানো হবে না
                 if txt.strip():
                     self.last_agent_text = txt.strip()
                     self.last_agent_kind = "MessageEvent"
@@ -1068,7 +1087,67 @@ class Watcher(threading.Thread):
         self._send_finish_line(conv, execution, sandbox)
         return True
 
+    def _maybe_brain_poll(self) -> bool:
+        """রান শেষে এজেন্টের কাছে নতুন মেমোরি চাও (উত্তর ইউজারকে দেখানো হয় না)।"""
+        if self.capture_mode:
+            return time.time() < self.capture_deadline
+        if self.brain_polled or self.run_actions < 1:
+            return False
+        self.brain_polled = True
+        self.capture_mode = "brain"
+        self.capture_deadline = time.time() + 150
+        try:
+            oh().send_message(self.cid, _BRAIN_POLL_TEXT, run=True)
+            log("brain poll sent (auto-brain)")
+        except Exception as e:
+            log("brain poll failed:", str(e)[:120])
+            self.capture_mode = ""
+            return False
+        return True
+
+    def _apply_capture(self, mode: str, txt: str) -> None:
+        """এজেন্টের মেমোরি/নিয়ম-উত্তর BRAIN.md-তে লেখো (ডুপ্লিকেট বাদ)।"""
+        try:
+            low = txt.strip().lower()
+            if low in ("none", "none.", "নাই", "নেই", "কিছু না"):
+                return
+            lines = [l.strip(" -•\t") for l in txt.splitlines() if l.strip(" -•\t")]
+            if mode == "rule":
+                lines = [lines[0][:220]] if lines else []
+                header = "## ভুল-থেকে-শেখা নিয়ম"
+            else:
+                lines = [l[:220] for l in lines][:4]
+                header = "## অটো-মেমোরি"
+            if not lines:
+                return
+            path = "BRAIN.md"
+            try:
+                cur = io.open(path, encoding="utf-8").read()
+            except Exception:
+                cur = ""
+            norm = {re.sub(r"\s+", " ", l).strip().lower() for l in cur.splitlines()}
+            add = [l for l in lines if re.sub(r"\s+", " ", l).strip().lower() not in norm]
+            if not add:
+                log("brain capture: all duplicates, skipped")
+                return
+            if header not in cur:
+                cur = cur.rstrip() + "\n\n" + header + "\n"
+            import datetime as _dt
+            date = _dt.date.today().isoformat()
+            block = "\n".join(f"- {l} ({date})" for l in add)
+            idx = cur.index(header) + len(header)
+            nl = cur.find("\n", idx)
+            cur = cur[:nl + 1] + block + "\n" + cur[nl + 1:]
+            io.open(path, "w", encoding="utf-8").write(cur)
+            load_brain()
+            log(f"brain updated ({mode}): +{len(add)} line")
+        except Exception:
+            log("capture apply crash:", traceback.format_exc()[:300])
+
     def _send_finish_line(self, conv: dict, execution: str, sandbox: str) -> None:
+        if self.finished_once:
+            return
+        self.finished_once = True
         # ইঞ্জিন/এজেন্ট এরর + কিছু ডেলিভার হয়নি -> শেষ লাইন নয়, ব্যাকআপে স্বয়ংক্রিয় সুইচ
         if (execution == "error" or self.last_err) and self.delivered_runs == 0 and self.run_actions == 0:
             chain = ["gemini-free", "groq-free", "openrouter-free"]
@@ -1150,6 +1229,18 @@ def _is_intent_only(text: str) -> bool:
         return False
     return t.endswith(":") or bool(_INTENT_RE.search(t))
 
+
+_BRAIN_POLL_TEXT = ("INTERNAL (user-কে দেখাবে না): এইমাত্র শেষ হওয়া কাজ থেকে নতুন কোনো স্থায়ী তথ্য/"
+                    "সিদ্ধান্ত/ইউজার-পছন্দ শিখে থাকলে প্রতিটি এক লাইনে বুলেট (- ) হিসেবে সর্বোচ্চ ৪টা লেখো। "
+                    "কিছু না থাকলে শুধু NONE লেখো। এই উত্তর শুধু মেমোরি-সিস্টেমের জন্য।")
+_RULE_TEXT = ("INTERNAL (user-কে দেখাবে না): ইউজারের মন্তব্য: \"{user}\" — অর্থাৎ তোমার আগের আউটপুটে ভুল ছিল। "
+              "এই ভুলটি ভবিষ্যতে ঠেকাবার স্থায়ী নিয়ম এক লাইনে (সর্বোচ্চ ২২০ অক্ষর) লেখো। শুধু সেই এক লাইন উত্তর দাও।")
+_LIVE_SEARCH_INSTR = ("[LIVE-SEARCH MODE — বাধ্যতামূলক] এই প্রশ্নে টাটকা তথ্য লাগবে। উত্তরের আগে shell দিয়ে লাইভ ডেটা নাও: "
+                      "curl -s 'https://html.duckduckgo.com/html/?q=<query>' ; যেকোনো ফলাফলের পুরো পাতা পড়তে "
+                      "curl -s 'https://r.jina.ai/<url>' ; বিকল্প: curl -s 'https://en.wikipedia.org/w/api.php?action=query&list=search&srquery=<query>&format=json' । "
+                      "২+ সোর্স মिलाও; উত্তরে তারিখ ও সোর্স-URL দাও; সময়-সংবেদনশীল তথ্য কখনো স্মৃতি থেকে নয়।")
+SEARCH_RE = __import__("re").compile(
+    r"(সার্চ|খবর|news|latest|সর্বশেষ|আজকের|আবহাওয়া|weather|stock|শেয়ারের দাম|টাটকা)", __import__("re").I)
 
 _NUDGE_TEXT = ("🛑 থামো: তোমার শেষ মেসেজটা শুধু ইচ্ছের কথা ছিল, আসল কাজ নয়। এই টার্নেই এখন "
                "টুল কল করে কাজটা শেষ করো (ফাইল তৈরি / কমান্ড চালানো), ফলাফল যাচাই করো, "
@@ -2130,6 +2221,126 @@ def _verify_run(chat_id: int, cid: str, payload: str, imgs: list | None = None) 
     TG.send(chat_id, "⚠️ এজেন্ট চালু হতে দেরি করছে — একটু পরে আবার লিখুন অথবা /status দেখুন।")
 
 
+# ===================== নলেজ-বেস (RAG) + লাইভ-সার্চ ইনজেকশন ===================== #
+KB_DIR = "kb"
+_FTS = None
+_KB_READY = False
+
+
+def _kb_lazy() -> None:
+    global _KB_READY
+    if not _KB_READY:
+        _KB_READY = True
+        threading.Thread(target=kb_reindex, daemon=True).start()
+
+
+def _kb_extract(name: str, data: bytes) -> str:
+    ext = name.lower().rsplit(".", 1)[-1]
+    try:
+        if ext in ("txt", "md", "csv", "log"):
+            return data.decode("utf-8", "replace")
+        if ext == "html":
+            t = data.decode("utf-8", "replace")
+            t = re.sub(r"<script.*?</script>|<style.*?</style>", " ", t, flags=re.S | re.I)
+            return re.sub(r"<[^>]+>", " ", t)
+        if ext == "pdf":
+            try:
+                import pypdf, io as _io
+                r = pypdf.PdfReader(_io.BytesIO(data))
+                return "\n".join((pg.extract_text() or "") for pg in r.pages[:120])
+            except Exception:
+                return ""
+        if ext == "docx":
+            try:
+                import docx, io as _io
+                d = docx.Document(_io.BytesIO(data))
+                return "\n".join(p.text for p in d.paragraphs)
+            except Exception:
+                return ""
+    except Exception:
+        return ""
+    return ""
+
+
+def kb_reindex() -> None:
+    global _FTS
+    import sqlite3, os
+    try:
+        con = sqlite3.connect(":memory:", check_same_thread=False)
+        con.execute("create virtual table kb using fts5(fname, body)")
+        n = 0
+        if os.path.isdir(KB_DIR):
+            for fn in os.listdir(KB_DIR):
+                try:
+                    body = _kb_extract(fn, open(os.path.join(KB_DIR, fn), "rb").read())
+                except Exception:
+                    body = ""
+                if body.strip():
+                    con.execute("insert into kb(fname, body) values(?, ?)", (fn, body[:200000]))
+                    n += 1
+        _FTS = con
+        log(f"[kb] index ready: {n} file")
+    except Exception:
+        log("[kb] reindex crash:", traceback.format_exc()[:300])
+        _FTS = None
+
+
+def kb_search(q: str, k: int = 3) -> list:
+    if _FTS is None or not (q or "").strip():
+        return []
+    toks = re.findall(r"[\w\u0980-\u09FF]{3,}", q)[:6]
+    if not toks:
+        return []
+    match = " OR ".join(f'"{t}"*' for t in toks)
+    try:
+        return _FTS.execute(
+            "select fname, snippet(kb, 1, '', '', ' … ', 14) from kb where kb match ? "
+            "order by rank limit ?", (match, k)).fetchall()
+    except Exception:
+        return []
+
+
+def kb_add(chat_id: int, name: str, data: bytes) -> None:
+    import os, base64 as _b64
+    try:
+        os.makedirs(KB_DIR, exist_ok=True)
+        safe = re.sub(r"[^\w.\-]", "_", name)[:80]
+        with open(os.path.join(KB_DIR, safe), "wb") as f:
+            f.write(data)
+        try:
+            import state_sync
+            body = _b64.b64encode(data).decode()
+            sha = None
+            try:
+                sha = (state_sync._req("GET", f"/repos/{state_sync._REPO}/contents/kb/{safe}") or {}).get("sha")
+            except Exception:
+                sha = None
+            bd = {"message": f"kb: add {safe} [skip ci]", "content": body}
+            if sha:
+                bd["sha"] = sha
+            state_sync._req("PUT", f"/repos/{state_sync._REPO}/contents/kb/{safe}", bd)
+        except Exception as e:
+            log("[kb] vault push failed:", str(e)[:120])
+        kb_reindex()
+        TG.send(chat_id, f"📚 <b>{safe}</b> নলেজ-বেসে ঢুকে গেছে ✅ — এখন প্রশ্ন করলে উৎসসহ উত্তর দেব।")
+    except Exception:
+        log("[kb] add crash:", traceback.format_exc()[:300])
+        TG.send(chat_id, "⚠️ নলেজ-বেসে ফাইলটা রাখা যায়নি।")
+
+
+def enrich_outgoing(chat_id: int, text: str) -> str:
+    t = text or ""
+    pre: list[str] = []
+    hits = kb_search(t, 3)
+    if hits:
+        src = "\n".join(f"[উৎস: {f}] …{sn}…" for f, sn in hits)
+        pre.append("[USER-KNOWLEDGE-BASE — ইউজারের সংরক্ষিত ফাইল থেকে প্রাসঙ্গিক অংশ। "
+                   "উত্তরে উৎসের ফাইলনাম উল্লেখ করো:\n" + src + "]")
+    if SEARCH_RE.search(t):
+        pre.append(_LIVE_SEARCH_INSTR)
+    return "\n\n".join(pre) + "\n\n" + t if pre else t
+
+
 def send_to_agent(chat_id: int, text: str, photo_b64: str | None = None,
                   photo_ext: str = "png", doc_name: str | None = None,
                   doc_data: bytes | None = None) -> None:
@@ -2373,6 +2584,7 @@ COMMANDS["alarm"] = cmd_remind
 
 
 def handle_update(update: dict) -> None:
+    _kb_lazy()
     if "callback_query" in update:
         handle_callback(update["callback_query"])
         return
@@ -2446,6 +2658,30 @@ def handle_update(update: dict) -> None:
 
     text = msg.get("text") or msg.get("caption") or ""
 
+    # 📚 /kb — ফাইল নলেজ-বেসে সংরক্ষণ (ভল্ট + ইনডেক্স)
+    if doc_data and (text or "").strip().lower().startswith("/kb"):
+        threading.Thread(target=kb_add, args=(chat_id, doc_name or "file.txt", doc_data),
+                         daemon=True).start()
+        return
+
+    # 📝 সংশোধন ডিটেক্ট -> নিয়ম ব্রেইনে (এজেন্টের পরের উত্তরটা নিয়ম হিসেবে ধরা হবে)
+    if (text and len(text) < 60
+            and re.search(r"(ভুল|ঠিক না|হয়নি|এটা না|সত্যি না)", text)
+            and not re.search(r"(ঠিক কর|রিমুভ|বানা|করো|fix|remove|build|সরা)", text)):
+        with WATCHER_LOCK:
+            w = WATCHERS.get(chat_id)
+        if w is not None and not w.capture_mode:
+            w.capture_mode = "rule"
+            w.capture_deadline = time.time() + 150
+            try:
+                oh().send_message(w.cid, _RULE_TEXT.format(user=text[:150]), run=True)
+                TG.send(chat_id, "📝 বুঝেছি ভাই — নিয়মটা ব্রেইনে লিখিয়ে নিচ্ছি, যাতে ভুলটা আর না হয়। "
+                                 "আবার করাতে চাইলে বলো \"আবার করো\"।")
+                return
+            except Exception as e:
+                log("rule capture send failed:", str(e)[:120])
+                w.capture_mode = ""
+
     # কমান্ড?
     if text.startswith("/"):
         first_line = text.split("\n", 1)[0]
@@ -2506,6 +2742,7 @@ def handle_update(update: dict) -> None:
                                  "মনিয়ে করিয়ে দেব (বটের নিজের অ্যালার্ম — স্যান্ডবক্স ঘুমালেও থামবে না)")
                 return
 
+    text = enrich_outgoing(chat_id, text)
     send_to_agent(chat_id, text, photo_b64=photo_b64, photo_ext=photo_ext,
                   doc_name=doc_name, doc_data=doc_data)
 

@@ -55,7 +55,7 @@ jobs:
           python-version: '3.12'
 
       - name: Pillow (ছবি ছোট করে খরচ কমানোর জন্য)
-        run: python -m pip install --quiet pillow
+        run: python -m pip install --quiet -r requirements.txt
 
       - name: git পরিচয় সেট
         run: |
@@ -78,7 +78,7 @@ jobs:
           PHOTO_QUALITY: '72'
           LLM_MODEL: openhands/deepseek-v4.1-flash
           AGENT_PROFILE_ID: 'gemini-free'   # ফ্রি জেমিনি ইঞ্জিন (BYOK প্রোভাইডার কানেকশন)
-          SYSTEM_SUFFIX: "Always reply in Bangla unless the user writes in another language. Separate internal work from the final message: never show tool calls, shell commands, logs, planning or progress in the final message — only the result. Mobile-friendly clean output: short paragraphs, bullet/numbered lists instead of wide or ASCII tables, at most 2-3 short headings, links as [descriptive text](url) never bare long URLs, code only inside fenced blocks. Use simple natural Bangla like '🎉 কাজটি হয়ে গেছে।', not robotic formal sentences. Put the most important thing first (the link, file or direct answer), keep it under 6 short sentences, and never send the same answer twice. When serving a website: always serve it in background on port 12000 bound to 0.0.0.0 with index.html at the served root; verify the PUBLIC work-1 URL returns HTTP 200 with curl before sharing it; share the link only once."
+          SYSTEM_SUFFIX: "Always reply in Bangla unless the user writes in another language. Separate internal work from the final message: never show tool calls, shell commands, logs, planning or progress in the final message — only the result. Mobile-friendly clean output: short paragraphs, bullet/numbered lists instead of wide or ASCII tables, at most 2-3 short headings, links as [descriptive text](url) never bare long URLs, code only inside fenced blocks. Use simple natural Bangla like '🎉 কাজটি হয়ে গেছে।', not robotic formal sentences. Put the most important thing first (the link, file or direct answer), keep it under 6 short sentences, and never send the same answer twice. When serving a website: always serve it in background on port 12000 bound to 0.0.0.0 with index.html at the served root; verify the PUBLIC work-1 URL returns HTTP 200 with curl before sharing it; share the link only once. For time-sensitive questions (news, prices, versions, weather, today/সর্বশেষ/টাটকা), ALWAYS fetch live data first with shell (curl -s 'https://html.duckduckgo.com/html/?q=...' , full page via curl -s 'https://r.jina.ai/<url>') and cite the date + source URL; never answer current facts from memory."
           DB_PATH: state.db
           AUTORESTORE: 'true'
           GH_PAT: ${{ secrets.GH_PAT }}

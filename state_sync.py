@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import os
 import json
 import threading
 import time
@@ -54,6 +55,25 @@ def pull() -> None:
                 print("[state-sync] pull err:", path, e.code)
         except Exception as e:
             print("[state-sync] pull err:", path, str(e)[:120])
+    try:
+        items = _req("GET", f"/repos/{_REPO}/contents/kb") or []
+        got = 0
+        for it in items:
+            if it.get("type") != "file" or int(it.get("size") or 0) > 3_000_000:
+                continue
+            data = base64.b64decode(it.get("content") or "")
+            if data:
+                os.makedirs("kb", exist_ok=True)
+                with open(os.path.join("kb", it["name"]), "wb") as f:
+                    f.write(data)
+                got += 1
+        if got:
+            print(f"[state-sync] pulled kb/ ({got} files)")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print("[state-sync] kb pull err:", e.code)
+    except Exception as e:
+        print("[state-sync] kb pull err:", str(e)[:120])
 
 
 def push() -> None:
