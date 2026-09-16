@@ -653,6 +653,8 @@ class Watcher(threading.Thread):
         self.docs_sent = 0
         self.capture_mode = ""
         self.capture_deadline = 0.0
+        self.swallowed: set = set()
+        self.brain_poll_ts = 0.0
         self.brain_polled = False
         self.finished_once = False
         self.prev_execution = None
@@ -971,6 +973,7 @@ class Watcher(threading.Thread):
                 txt = extract_text(ev.get("llm_message")) or extract_text(ev.get("extended_content"))
                 if self.capture_mode and txt.strip():
                     mode, self.capture_mode = self.capture_mode, ""
+                    self.swallowed.add(ev.get("id") or "")
                     threading.Thread(target=self._apply_capture, args=(mode, txt.strip()),
                                      daemon=True).start()
                     continue   # মেমোরি-উত্তর: ইউজারকে দেখানো হবে না
@@ -1085,6 +1088,10 @@ class Watcher(threading.Thread):
                 et = _parse_iso(ev.get("timestamp"))
                 if not et or et < cutoff:
                     continue
+                if (ev.get("id") or "") in self.swallowed:
+                    continue
+                if self.brain_poll_ts and et >= self.brain_poll_ts - 1:
+                    continue   # মেমোরি-উত্তর: ইউজারকে দেখানো নিষেধ
                 txt = extract_text(ev.get("llm_message")) \
                     or extract_text(ev.get("extended_content"))
                 if txt and txt.strip():
@@ -1102,6 +1109,7 @@ class Watcher(threading.Thread):
         if self.brain_polled or self.run_actions < 1:
             return False
         self.brain_polled = True
+        self.brain_poll_ts = time.time()
         self.capture_mode = "brain"
         self.capture_deadline = time.time() + 150
         try:
