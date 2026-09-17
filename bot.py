@@ -2316,12 +2316,70 @@ def groq_transcribe(data: bytes, name: str) -> str:
         data,
         f"\r\n--{b}--\r\n".encode(),
     ])
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/audio/transcriptions", data=body,
-        headers={"Authorization": f"Bearer {key}",
-                 "Content-Type": f"multipart/form-data; boundary={b}"})
-    d = json.load(urllib.request.urlopen(req, timeout=120))
-    return (d.get("text") or "").strip()
+    try:
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/audio/transcriptions", data=body,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": f"multipart/form-data; boundary={b}"})
+        d = json.load(urllib.request.urlopen(req, timeout=120))
+        return (d.get("text") or "").strip()
+    except Exception as e:
+        log("groq stt failed:", str(e)[:150])
+        return ""
+
+
+def _selftest(chat_id: int) -> None:
+    import shutil, subprocess
+    out = ["🩺 সেলফ-টেস্ট (বটের ভেতর থেকে):"]
+    # ffmpeg / tesseract
+    out.append(("✅" if shutil.which("ffmpeg") else "❌") + " ffmpeg")
+    out.append(("✅" if shutil.which("tesseract") else "❌") + " tesseract (OCR)")
+    # gemini key + stt
+    gk = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not gk:
+        out.append("❌ GEMINI_API_KEY env খালি")
+    else:
+        try:
+            import wave as _w, struct as _st, math as _m
+            with _w.open("/tmp/_st.wav", "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                for i in range(16000):
+                    w.writeframes(_st.pack("<h", int(9000 * _m.sin(i / 16000 * 2 * _m.pi * 440))))
+            tr = transcribe_voice(open("/tmp/_st.wav", "rb").read(), "t.wav")
+            out.append(("✅" if tr else "❌") + f" ভয়েস-ইঞ্জিন: {tr[:40] or 'খালি'}")
+        except Exception as e:
+            out.append(f"❌ ভয়েস-ইঞ্জিন: {str(e)[:70]}")
+    # tts
+    try:
+        from gtts import gTTS
+        import io as _io
+        b = _io.BytesIO(); gTTS(text="সেলফ টেস্ট", lang="bn").write_to_fp(b)
+        out.append(("✅" if b.tell() > 3000 else "❌") + f" বাংলা TTS ({b.tell()}B)")
+    except Exception as e:
+        out.append(f"❌ TTS: {str(e)[:70]}")
+    # img
+    try:
+        req = urllib.request.Request(
+            "https://image.pollinations.ai/prompt/red%20boat?width=256&height=256&nologo=true",
+            headers={"User-Agent": "Mozilla/5.0"})
+        d = urllib.request.urlopen(req, timeout=120).read()
+        out.append(("✅" if len(d) > 2000 else "❌") + f" ইমেজ-জেন ({len(d)}B)")
+    except Exception as e:
+        out.append(f"❌ ইমেজ-জেন: {str(e)[:70]}")
+    # jina
+    try:
+        req = urllib.request.Request("https://r.jina.ai/https://example.com",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        pg = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+        out.append(("✅" if "Example" in pg else "❌") + " লিংক-রিডার (jina)")
+    except Exception as e:
+        out.append(f"❌ লিংক-রিডার: {str(e)[:70]}")
+    # kb
+    try:
+        out.append(f"✅ নলেজ-বেস: {_FTS.execute('select count(*) from kb').fetchone()[0] if _FTS else 0} ফাইল")
+    except Exception:
+        out.append("❌ নলেজ-বেস ইনডেক্স নেই")
+    TG.send(chat_id, "\n".join(out))
 
 
 def _img_gen(chat_id: int, prompt: str) -> None:
@@ -2329,14 +2387,24 @@ def _img_gen(chat_id: int, prompt: str) -> None:
         TG.send(chat_id, "🎨 ছবি বানাচ্ছি (~২০-৬০ সেকেন্ড)…")
         url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:800])
                + "?width=1024&height=1024&nologo=true")
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        data = urllib.request.urlopen(req, timeout=180).read()
+        data = b""
+        last = ""
+        for att in (1, 2, 3):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                data = urllib.request.urlopen(req, timeout=200).read()
+                if len(data) >= 2000:
+                    break
+                last = "tiny"
+            except Exception as e:
+                last = str(e)[:80]
+                time.sleep(3)
         if len(data) < 2000:
-            raise RuntimeError("tiny response")
+            raise RuntimeError(last or "empty")
         TG.send_photo(chat_id, data, caption=f"🎨 {prompt[:300]}")
     except Exception as e:
         log("img gen failed:", str(e)[:150])
-        TG.send(chat_id, "⚠️ ছবি বানানো যায়নি — একটু পরে আবার চেষ্টা করো।")
+        TG.send(chat_id, f"⚠️ ছবি বানানো যায়নি ({str(e)[:80]}) — একটু পরে আবার চেষ্টা করো।")
 
 
 def _tts_send(chat_id: int, text: str) -> None:
@@ -2818,7 +2886,22 @@ def handle_update(update: dict) -> None:
         v = msg.get("voice") or msg.get("audio")
         try:
             name, data = TG.download(v["file_id"], max_bytes=20 * 1024 * 1024)
-            tr = transcribe_voice(data or b"", name or "voice.ogg")
+            if not data:
+                TG.send(chat_id, "⚠️ ভয়েস ফাইলটা নামানো যায়নি — আবার পাঠাও।")
+                return
+            # ogg/opus -> wav (Gemini-র জন্য নিশ্চিত ফরম্যাট)
+            try:
+                import subprocess
+                open("/tmp/_v_in.ogg", "wb").write(data)
+                r = subprocess.run(["ffmpeg", "-y", "-i", "/tmp/_v_in.ogg",
+                                    "-ar", "16000", "-ac", "1", "/tmp/_v_in.wav"],
+                                   capture_output=True, timeout=60)
+                if r.returncode == 0:
+                    data = open("/tmp/_v_in.wav", "rb").read()
+                    name = "voice.wav"
+            except Exception as e:
+                log("voice convert failed:", str(e)[:100])
+            tr = transcribe_voice(data, name or "voice.ogg")
             if tr:
                 VOICE_PENDING[chat_id] = time.time()   # মিরর: উত্তর ভয়েসেও যাবে
             if not tr:
@@ -2828,8 +2911,8 @@ def handle_update(update: dict) -> None:
             msg.pop("voice", None); msg.pop("audio", None)
             msg["text"] = (msg.get("caption") or "") + f"\n[ভয়েস-মেসেজ ট্রান্সক্রিপ্ট]: {tr}"
         except Exception as e:
-            log("voice failed:", str(e)[:150])
-            TG.send(chat_id, "⚠️ ভয়েস প্রসেস করা যায়নি — আবার পাঠাও বা টেক্সট লেখো।")
+            log("voice failed:", str(e)[:200])
+            TG.send(chat_id, f"⚠️ ভয়েস প্রসেস করা যায়নি ({str(e)[:80]}) — আবার পাঠাও বা টেক্সট লেখো।")
             return
 
     # ছবি/ডকুমেন্ট
@@ -2889,6 +2972,11 @@ def handle_update(update: dict) -> None:
     text = msg.get("text") or msg.get("caption") or ""
     if ocr_text:
         text = (text + "\n" if text else "") + f"[ছবি থেকে OCR টেক্সট]:\n{ocr_text[:6000]}"
+
+    # 🩺 /selftest — রানারের ভেতর থেকে সব ইঞ্জিন পরীক্ষা
+    if text.strip().lower() == "/selftest":
+        threading.Thread(target=_selftest, args=(chat_id,), daemon=True).start()
+        return
 
     # 🎨 /img — ফ্রি ইমেজ জেনারেশন
     if text.strip().lower().startswith("/img"):
