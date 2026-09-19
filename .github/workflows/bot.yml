@@ -24,6 +24,7 @@ concurrency:
 
 permissions:
   contents: write             # state.db কমিট করার জন্য
+  actions: write              # github.token দিয়ে পরের রান dispatch করার জন্য
 
 jobs:
   bot:
@@ -35,7 +36,8 @@ jobs:
         run: |
           active=$(curl -s -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=10" \
-            | python3 -c "import json,sys; print(sum(1 for r in json.load(sys.stdin)['workflow_runs'] if r['id'] != ${{ github.run_id }}))")
+            | python3 -c "import json,sys; print(sum(1 for r in json.load(sys.stdin).get('workflow_runs',[]) if r['id'] != ${{ github.run_id }}))" 2>/dev/null || echo 0)
+          active=${active:-0}
           echo "other active runs: $active"
           if [ "$active" != "0" ]; then
             curl -s -X POST -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
@@ -106,10 +108,20 @@ jobs:
 
           set +e
           deadline=$(( $(date +%s) + 348*60 ))
+          quick=0
           while [ $(date +%s) -lt $deadline ]; do
+            start=$(date +%s)
             python3 bot.py
             code=$?
-            echo "bot exited code $code - restart in 5s (crash loop)"
+            dur=$(( $(date +%s) - start ))
+            # সাথে সাথে মরে গেলে (বাগ/খারাপ secret) পুরো ৬ ঘণ্টা অকারণ না ঘোরাতে
+            # টানা ২০ বার দ্রুত মৃত্যু হলে থেমে যাই, যাতে সমস্যা চোখে পড়ে।
+            if [ "$dur" -lt 10 ]; then quick=$((quick+1)); else quick=0; fi
+            if [ "$quick" -ge 20 ]; then
+              echo "::error::bot বারবার সাথে সাথে বন্ধ হচ্ছে ($quick বার) - লুপ থামানো হলো"
+              break
+            fi
+            echo "bot exited code $code after ${dur}s - restart in 5s"
             sleep 5
           done
           set -e
@@ -118,8 +130,17 @@ jobs:
       - name: পরের রান ডিসপ্যাচ (ব্যাটন)
         if: always()
         run: |
-          curl -s -o /dev/null -w "dispatch:%{http_code}\n" -X POST \
-            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+          # github.token দিয়ে ব্যাটন — GH_PAT মেয়াদোত্তীর্ণ হলেও লুপ চলবে
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches" \
-            -d '{"ref":"main"}' || true
+            -d '{"ref":"main"}' || true)
+          echo "dispatch:${code}"
+          if [ "$code" != "204" ]; then
+            curl -s -o /dev/null -w "dispatch-fallback:%{http_code}\n" -X POST \
+              -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches" \
+              -d '{"ref":"main"}' || true
+          fi
